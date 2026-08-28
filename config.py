@@ -88,7 +88,7 @@ COMPANIES = {
     "whiteness": {
         "display_name": "Whiteness Cleaning",
         "legal_name": "Whiteness Cleaning",
-        "logo_path": os.path.join(LOGOS_DIR, "whiteness.png"),
+        "logo_path": os.path.join(LOGOS_DIR, "whiteness(1).png"),
         "stamp_path": os.path.join(STAMPS_DIR, "whiteness.png"),
         "address_lines": [
             "Building 1172, Road 5443, Buri",
