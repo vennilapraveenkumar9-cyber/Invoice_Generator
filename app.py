@@ -42,8 +42,10 @@ from security import (
     safe_filename, bounded_int, bounded_float,
 )
 from pdf_generator import build_invoice_pdf
+import theme
 
 st.set_page_config(page_title="Invoice Generator", page_icon="🧾", layout="wide")
+theme.inject(st)
 
 
 # ---------------------------------------------------------------------------
