@@ -48,6 +48,9 @@ COMPANIES = {
         "iban": "BH53FIBH11000487340001",
         "footer_tagline": "General Cleaning | Carpet / Sofa Shampooing | Marble Polishing | "
                            "Water Tank Cleaning | Facade Cleaning | etc.",
+        "footer_bg_color": "#0F4E82",
+        "footer_text_color": "#FFFFFF",
+        "footer_accent_color": "#DC3C62",
         "brand_color": "#D81F42",
         "invoice_title": "TAX INVOICE",
     },
@@ -66,7 +69,11 @@ COMPANIES = {
         "email": "aljameeltc@gmail.com",
         "account_name": "Al Jameel Tower Construction & Trading",
         "iban": "BH63BIBB00100000100082",
-        "footer_tagline": "",
+        "footer_tagline": "CR: 27387-3, RD: 58, Bld: 12, Blk: 756 BURI | "
+                           "Contact: 33569858 38736809 | Email: aljameeltc@gmail.com",
+        "footer_bg_color": "#5D6E85",
+        "footer_text_color": "#FFFFFF",
+        "footer_accent_color": "",
         "brand_color": "#1789C9",
         "invoice_title": "TAX INVOICE",
     },
@@ -86,6 +93,9 @@ COMPANIES = {
         "account_name": "Whiteness Cleaning",
         "iban": "BH63 ALSA 0025 5773 1001 00",
         "footer_tagline": "",
+        "footer_bg_color": "#E23054",
+        "footer_text_color": "#FFFFFF",
+        "footer_accent_color": "",
         "brand_color": "#E23054",
         "invoice_title": "INVOICE",
     },
@@ -164,3 +174,7 @@ NO_STAMP_LABEL = "No stamp"
 
 CURRENCY = "BHD"
 DEFAULT_VAT_PERCENT = 10.0
+
+# Sampled from the original invoices' scanned paper (very close to white,
+# with the faintest warm-gray cast) so generated PDFs match the paper tone.
+PAGE_BACKGROUND_COLOR = "#FDFDFB"
