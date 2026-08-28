@@ -30,6 +30,7 @@ from reportlab.platypus.flowables import HRFlowable
 
 from security import xml_safe
 from wordify import amount_to_words
+from config import PAGE_BACKGROUND_COLOR
 
 CURRENCY = "BHD"
 
@@ -94,7 +95,13 @@ def _safe_image(path_or_bytes, max_w, max_h):
         buf2 = io.BytesIO()
         pil_img.convert("RGBA").save(buf2, format="PNG")
         buf2.seek(0)
-        return RLImage(buf2, width=disp_w, height=disp_h)
+        img_flowable = RLImage(buf2, width=disp_w, height=disp_h)
+        # ReportLab's Image flowable defaults to CENTER alignment inside its
+        # available width, which visually "floats" the stamp/logo away from
+        # the text next to/above it. Force LEFT so it sits flush under
+        # "Authorized Signatory & Stamp" (and flush left in the header).
+        img_flowable.hAlign = "LEFT"
+        return img_flowable
     except Exception:
         return None
 
@@ -129,7 +136,7 @@ def build_invoice_pdf(data: dict) -> bytes:
     # ---------------------------------------------------------- header ----
     logo_flowable = _safe_image(
         data.get("logo_override_bytes") or company.get("logo_path"),
-        max_w=55 * mm, max_h=22 * mm,
+        max_w=70 * mm, max_h=28 * mm,
     )
     contact_lines = []
     if company.get("contact"):
@@ -183,18 +190,31 @@ def build_invoice_pdf(data: dict) -> bytes:
     bill_addr = "<br/>".join(xml_safe(l) for l in data.get("bill_to_address", []) if l)
     from_addr = "<br/>".join(xml_safe(l) for l in company.get("address_lines", []) if l)
 
-    bill_block = f"<b>Billed To:</b><br/><b>{xml_safe(data.get('bill_to_name',''))}</b><br/>{bill_addr}"
+    bill_bottom = bill_addr
     if data.get("bill_to_cr"):
-        bill_block += f"<br/>CR: {xml_safe(data['bill_to_cr'])}"
+        bill_bottom += f"<br/>CR: {xml_safe(data['bill_to_cr'])}"
     if data.get("bill_to_vat"):
-        bill_block += f"<br/>VAT: {xml_safe(data['bill_to_vat'])}"
+        bill_bottom += f"<br/>VAT: {xml_safe(data['bill_to_vat'])}"
 
-    from_block = f"<b>From:</b><br/><b>{xml_safe(company.get('legal_name',''))}</b><br/>{from_addr}"
+    from_bottom = from_addr
     if company.get("vat"):
-        from_block += f"<br/>VAT: {xml_safe(company['vat'])}"
+        from_bottom += f"<br/>VAT: {xml_safe(company['vat'])}"
+
+    divider_color = colors.HexColor("#9AA3AF")
+
+    bill_cell = [
+        Paragraph(f"<b>Billed To:</b><br/><b>{xml_safe(data.get('bill_to_name',''))}</b>", styles["Cell"]),
+        HRFlowable(width="100%", thickness=0.6, color=divider_color, spaceBefore=4, spaceAfter=4),
+        Paragraph(bill_bottom, styles["Cell"]),
+    ]
+    from_cell = [
+        Paragraph(f"<b>From:</b><br/><b>{xml_safe(company.get('legal_name',''))}</b>", styles["Cell"]),
+        HRFlowable(width="100%", thickness=0.6, color=divider_color, spaceBefore=4, spaceAfter=4),
+        Paragraph(from_bottom, styles["Cell"]),
+    ]
 
     parties_table = Table(
-        [[Paragraph(bill_block, styles["Cell"]), Paragraph(from_block, styles["Cell"])]],
+        [[bill_cell, from_cell]],
         colWidths=[None, None],
     )
     parties_table.setStyle(TableStyle([
@@ -272,8 +292,6 @@ def build_invoice_pdf(data: dict) -> bytes:
     rows.append(totals_row)
 
     n_extra = len(extra_columns)
-    desc_width = None
-    fixed_narrow = 16 * mm
     col_widths = [12 * mm, None] + [22 * mm] * n_extra + [24 * mm, 14 * mm]
     if has_vat_column:
         col_widths += [16 * mm, 20 * mm]
@@ -325,18 +343,37 @@ def build_invoice_pdf(data: dict) -> bytes:
     if stamp_flowable:
         story.append(stamp_flowable)
 
-    def _footer(canvas, doc_):
-        tagline = company.get("footer_tagline")
-        if not tagline:
-            return
+    def _page_decorations(canvas, doc_):
+        page_w, page_h = doc_.pagesize
         canvas.saveState()
-        band_h = 8 * mm
-        canvas.setFillColor(colors.HexColor(company.get("brand_color", "#1F3864")))
-        canvas.rect(0, 0, doc_.pagesize[0], band_h, stroke=0, fill=1)
-        canvas.setFillColor(colors.white)
-        canvas.setFont("Helvetica", 7.5)
-        canvas.drawCentredString(doc_.pagesize[0] / 2.0, band_h / 2.0 - 2.5, tagline[:180])
+
+        # ---- paper background (matches the sampled tone of the original
+        # scanned invoices, instead of ReportLab's default stark white) ----
+        canvas.setFillColor(colors.HexColor(PAGE_BACKGROUND_COLOR))
+        canvas.rect(0, 0, page_w, page_h, stroke=0, fill=1)
         canvas.restoreState()
 
-    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+        # ---- footer band (only for companies whose sample has one) ----
+        tagline = company.get("footer_tagline")
+        if tagline:
+            canvas.saveState()
+            band_h = 8 * mm
+            bg = company.get("footer_bg_color") or company.get("brand_color", "#1F3864")
+            fg = company.get("footer_text_color", "#FFFFFF")
+            accent = company.get("footer_accent_color")
+
+            canvas.setFillColor(colors.HexColor(bg))
+            canvas.rect(0, 0, page_w, band_h, stroke=0, fill=1)
+
+            if accent:
+                accent_w = 14 * mm
+                canvas.setFillColor(colors.HexColor(accent))
+                canvas.rect(page_w - accent_w, 0, accent_w, band_h, stroke=0, fill=1)
+
+            canvas.setFillColor(colors.HexColor(fg))
+            canvas.setFont("Helvetica", 7.5)
+            canvas.drawCentredString(page_w / 2.0, band_h / 2.0 - 2.5, tagline[:180])
+            canvas.restoreState()
+
+    doc.build(story, onFirstPage=_page_decorations, onLaterPages=_page_decorations)
     return buf.getvalue()
