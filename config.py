@@ -53,6 +53,9 @@ COMPANIES = {
         "footer_accent_color": "#DC3C62",
         "brand_color": "#D81F42",
         "invoice_title": "TAX INVOICE",
+        # YSCC keeps the original layout: small logo top-left + contact
+        # info (Contact/Email/CR) printed top-right by our code.
+        "header_style": "standard",
     },
     "aljameel": {
         "display_name": "Al Jameel Tower Construction & Trading",
@@ -76,6 +79,11 @@ COMPANIES = {
         "footer_accent_color": "",
         "brand_color": "#1789C9",
         "invoice_title": "TAX INVOICE",
+        # The uploaded logo file for this company IS the full letterhead
+        # (logo + Arabic/English name + contact block), so it's centered
+        # and stretched across the top instead of paired with separate
+        # code-generated contact text.
+        "header_style": "banner",
     },
     "whiteness": {
         "display_name": "Whiteness Cleaning",
@@ -98,6 +106,8 @@ COMPANIES = {
         "footer_accent_color": "",
         "brand_color": "#E23054",
         "invoice_title": "INVOICE",
+        # Same as Al Jameel: the logo file is the full top letterhead.
+        "header_style": "banner",
     },
 }
 
