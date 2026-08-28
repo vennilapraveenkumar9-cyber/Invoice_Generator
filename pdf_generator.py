@@ -74,7 +74,7 @@ def _style_sheet():
     return styles
 
 
-def _safe_image(path_or_bytes, max_w, max_h):
+def _safe_image(path_or_bytes, max_w, max_h, align="LEFT"):
     """Load an image (path or raw bytes) and scale it to fit within a box,
     preserving aspect ratio. Returns None if the image can't be loaded."""
     if not path_or_bytes:
@@ -97,10 +97,10 @@ def _safe_image(path_or_bytes, max_w, max_h):
         buf2.seek(0)
         img_flowable = RLImage(buf2, width=disp_w, height=disp_h)
         # ReportLab's Image flowable defaults to CENTER alignment inside its
-        # available width, which visually "floats" the stamp/logo away from
-        # the text next to/above it. Force LEFT so it sits flush under
-        # "Authorized Signatory & Stamp" (and flush left in the header).
-        img_flowable.hAlign = "LEFT"
+        # available width. We make this explicit and configurable: LEFT for
+        # the small YSCC-style logo and the signature stamp (flush with the
+        # text beside/above it), CENTER for a full-width letterhead banner.
+        img_flowable.hAlign = align
         return img_flowable
     except Exception:
         return None
@@ -134,31 +134,48 @@ def build_invoice_pdf(data: dict) -> bytes:
     story = []
 
     # ---------------------------------------------------------- header ----
-    logo_flowable = _safe_image(
-        data.get("logo_override_bytes") or company.get("logo_path"),
-        max_w=70 * mm, max_h=28 * mm,
-    )
-    contact_lines = []
-    if company.get("contact"):
-        contact_lines.append(f"Contact: {xml_safe(company['contact'])}")
-    if company.get("email"):
-        contact_lines.append(f"Email: {xml_safe(company['email'])}")
-    if company.get("cr"):
-        contact_lines.append(f"CR: {xml_safe(company['cr'])}")
-    contact_para = Paragraph("<br/>".join(contact_lines), styles["SmallRight"])
+    header_style = company.get("header_style", "standard")
+    content_width = doc.width  # full usable width between margins
 
-    header_table = Table(
-        [[logo_flowable or "", contact_para]],
-        colWidths=[100 * mm, None],
-    )
-    header_table.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-    ]))
-    story.append(header_table)
-    story.append(Spacer(1, 6))
+    if header_style == "banner":
+        # The company supplied a single "full top part" image that already
+        # contains the logo, wordmark, and contact details -- so it's shown
+        # centered, spanning the page width, with no separate contact block
+        # underneath (that info is already inside the image).
+        banner_flowable = _safe_image(
+            data.get("logo_override_bytes") or company.get("logo_path"),
+            max_w=content_width, max_h=42 * mm, align="CENTER",
+        )
+        if banner_flowable:
+            story.append(banner_flowable)
+        story.append(Spacer(1, 6))
+    else:
+        logo_flowable = _safe_image(
+            data.get("logo_override_bytes") or company.get("logo_path"),
+            max_w=70 * mm, max_h=28 * mm, align="LEFT",
+        )
+        contact_lines = []
+        if company.get("contact"):
+            contact_lines.append(f"Contact: {xml_safe(company['contact'])}")
+        if company.get("email"):
+            contact_lines.append(f"Email: {xml_safe(company['email'])}")
+        if company.get("cr"):
+            contact_lines.append(f"CR: {xml_safe(company['cr'])}")
+        contact_para = Paragraph("<br/>".join(contact_lines), styles["SmallRight"])
+
+        header_table = Table(
+            [[logo_flowable or "", contact_para]],
+            colWidths=[100 * mm, None],
+        )
+        header_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        story.append(header_table)
+        story.append(Spacer(1, 6))
+
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#999999")))
     story.append(Spacer(1, 8))
 
@@ -321,9 +338,12 @@ def build_invoice_pdf(data: dict) -> bytes:
 
     # -------------------------------------------------------- payment ----
     story.append(Paragraph("<b>Payment Details:</b>", styles["Small"]))
-    story.append(Paragraph(f"Account Name: {xml_safe(data.get('account_name', company.get('account_name','')))}",
-                            styles["Small"]))
-    story.append(Paragraph(f"IBAN: {xml_safe(data.get('iban', company.get('iban','')))}", styles["Small"]))
+    story.append(Paragraph(
+        f"Account Name: <b>{xml_safe(data.get('account_name', company.get('account_name','')))}</b>",
+        styles["Small"]))
+    story.append(Paragraph(
+        f"IBAN: <b>{xml_safe(data.get('iban', company.get('iban','')))}</b>",
+        styles["Small"]))
     story.append(Spacer(1, 8))
 
     if data.get("notes"):
@@ -338,7 +358,7 @@ def build_invoice_pdf(data: dict) -> bytes:
 
     stamp_flowable = _safe_image(
         data.get("stamp_override_bytes") or company.get("stamp_path"),
-        max_w=42 * mm, max_h=42 * mm,
+        max_w=42 * mm, max_h=42 * mm, align="LEFT",
     )
     if stamp_flowable:
         story.append(stamp_flowable)
