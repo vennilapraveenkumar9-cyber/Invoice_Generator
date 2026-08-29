@@ -1,363 +1,477 @@
 """
-app.py
-------
-Streamlit front-end for the Invoice Generator.
+pdf_generator.py
+-----------------
+Builds the final invoice PDF with ReportLab (Platypus) from a plain-dict
+"invoice data" structure assembled by app.py. Kept independent of
+Streamlit so it can be unit-tested or reused from a CLI/script.
 
-Flow:
-  1. Pick a company profile (logo / stamp / bank details auto-fill, all editable).
-  2. Pick a "Billed To" client from presets, or add a new one.
-  3. Fill invoice meta (date, invoice no, LPO, payment terms).
-  4. Build the line-items table (dynamic rows + optional extra columns);
-     VAT and totals are computed automatically.
-  5. Preview totals, then generate & download the PDF.
-
-Security notes (see security.py for the implementation):
-  - All text fields are length-capped and control-character-stripped.
-  - All text is XML-escaped before being placed into the PDF (ReportLab
-    Paragraphs use a small XML markup language, so raw user text could
-    otherwise break layout or inject markup).
-  - Uploaded logo/stamp images are validated (type, size, real image
-    content) and re-encoded through Pillow before use -- the original
-    uploaded bytes are never written to disk or passed through untouched.
-  - Row/column counts and numeric fields are clamped to sane ranges to
-    prevent pathological/oversized PDFs.
-  - Optional app-wide access code via st.secrets (disabled unless you
-    configure it) -- see README.md.
-  - Generated PDFs are built in-memory (io.BytesIO) and never written to
-    a predictable path on disk.
+All free-text fields are escaped with security.xml_safe() right before
+they are placed into a Paragraph, since ReportLab Paragraph text is
+interpreted as a small XML/HTML-like markup language.
 """
 
-import datetime
 import io
+import os
 
-import streamlit as st
-
-from config import (
-    COMPANIES, PRESET_CLIENTS, NEW_CLIENT_LABEL, CUSTOM_LOGO_LABEL,
-    CUSTOM_STAMP_LABEL, NO_STAMP_LABEL, MAX_ITEM_ROWS, MAX_EXTRA_COLUMNS,
-    DEFAULT_VAT_PERCENT, CURRENCY,
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+    Paragraph,
+    Spacer,
+    Image as RLImage,
 )
-from security import (
-    clean_text, clean_multiline, validate_uploaded_image, ValidationError,
-    safe_filename, bounded_int, bounded_float,
-)
-from pdf_generator import build_invoice_pdf
-import theme
+from reportlab.platypus.flowables import HRFlowable
 
-st.set_page_config(page_title="Invoice Generator", page_icon="🧾", layout="wide")
-theme.inject(st)
+from security import xml_safe
+from wordify import amount_to_words
+from config import PAGE_BACKGROUND_COLOR
+
+CURRENCY = "BHD"
+
+# Target print resolution for embedded logo/stamp/banner images. Source
+# scans are often lower-res than this; we resample up to it with a
+# high-quality filter + unsharp mask (see _enhance_clarity) so edges look
+# crisp in the PDF instead of soft/blurry when stretched to size.
+TARGET_DPI = 300
 
 
-# ---------------------------------------------------------------------------
-# Optional access-code gate. Fully OFF unless you add [auth] access_code to
-# .streamlit/secrets.toml -- keeps this safe to run locally with zero setup.
-# ---------------------------------------------------------------------------
-def _check_access_gate():
+def _style_sheet():
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="CompanyName", fontName="Helvetica-Bold", fontSize=16, leading=19,
+    ))
+    styles.add(ParagraphStyle(
+        name="InvoiceTitle", fontName="Helvetica-Bold", fontSize=15, leading=18,
+        alignment=TA_CENTER, spaceBefore=6, spaceAfter=10,
+    ))
+    styles.add(ParagraphStyle(
+        name="SmallRight", parent=styles["Normal"], fontSize=8.5, leading=11,
+        alignment=TA_RIGHT,
+    ))
+    styles.add(ParagraphStyle(
+        name="CellHeader", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=9.5, leading=12,
+    ))
+    styles.add(ParagraphStyle(
+        name="Cell", parent=styles["Normal"], fontSize=9.5, leading=12,
+    ))
+    styles.add(ParagraphStyle(
+        name="CellRight", parent=styles["Cell"], alignment=TA_RIGHT,
+    ))
+    styles.add(ParagraphStyle(
+        name="CellCenter", parent=styles["Cell"], alignment=TA_CENTER,
+    ))
+    styles.add(ParagraphStyle(
+        name="BoldCell", parent=styles["Cell"], fontName="Helvetica-Bold",
+    ))
+    styles.add(ParagraphStyle(
+        name="Small", parent=styles["Normal"], fontSize=9, leading=12,
+    ))
+    styles.add(ParagraphStyle(
+        name="Footer", parent=styles["Normal"], fontSize=8, leading=10,
+        textColor=colors.white, alignment=TA_CENTER,
+    ))
+    return styles
+
+
+def _enhance_clarity(pil_img, target_px_w, target_px_h):
+    """
+    Improve the *perceived* sharpness/clarity of a logo/stamp image before
+    it's embedded in the PDF.
+
+    Scanned letterhead crops tend to look soft once stretched to fill a
+    wide banner. We can't invent detail that isn't in the source, but we
+    can:
+      1. Resize with LANCZOS (a high-quality resampling filter) to the
+         exact pixel size the PDF will actually display it at, instead of
+         letting the PDF viewer do a cheap scale -- this alone removes a
+         lot of the "blurry stretch" look.
+      2. Apply a mild autocontrast pass to punch up washed-out scan
+         contrast (common with these scanned invoices).
+      3. Apply an UnsharpMask to recover crisp edges after resizing.
+    """
+    from PIL import Image as PILImage, ImageOps, ImageFilter
+
+    target_px_w = max(1, int(target_px_w))
+    target_px_h = max(1, int(target_px_h))
+
+    resized = pil_img.resize((target_px_w, target_px_h), resample=PILImage.LANCZOS)
+
+    # autocontrast needs an alpha-free image to work on cleanly; reapply
+    # the original alpha channel afterwards if present.
+    if resized.mode == "RGBA":
+        rgb = resized.convert("RGB")
+        alpha = resized.split()[-1]
+        rgb = ImageOps.autocontrast(rgb, cutoff=1)
+        rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.6, percent=140, threshold=3))
+        resized = rgb.convert("RGBA")
+        resized.putalpha(alpha)
+    else:
+        resized = ImageOps.autocontrast(resized.convert("RGB"), cutoff=1)
+        resized = resized.filter(ImageFilter.UnsharpMask(radius=1.6, percent=140, threshold=3))
+
+    return resized
+
+
+def _safe_image(path_or_bytes, max_w, max_h, align="LEFT", stretch_width=False):
+    """
+    Load an image (path or raw bytes), sharpen/clean it up, and scale it
+    to fit within a box.
+
+    stretch_width=False (default): fit within (max_w, max_h) preserving
+        aspect ratio -- used for the YSCC-style logo and the stamp, so
+        they're never distorted.
+    stretch_width=True: always fill the full max_w edge-to-edge (height
+        follows the image's own aspect ratio) -- used for the full-page
+        letterhead banner so it visually spans the page like the samples,
+        instead of floating with side margins if its aspect ratio happens
+        to be wider than max_h allows.
+
+    Returns None if the image can't be loaded.
+    """
+    if not path_or_bytes:
+        return None
     try:
-        required_code = st.secrets["auth"]["access_code"]
-    except Exception:
-        return True  # no gate configured
-
-    if st.session_state.get("_authed"):
-        return True
-
-    st.title("🔒 Invoice Generator")
-    code = st.text_input("Enter access code", type="password")
-    if st.button("Unlock"):
-        if code and code == required_code:
-            st.session_state["_authed"] = True
-            st.rerun()
+        from PIL import Image as PILImage
+        if isinstance(path_or_bytes, (bytes, bytearray)):
+            buf = io.BytesIO(path_or_bytes)
+            pil_img = PILImage.open(buf)
         else:
-            st.error("Incorrect code.")
-    return False
+            if not os.path.isfile(path_or_bytes):
+                return None
+            pil_img = PILImage.open(path_or_bytes)
+        pil_img = pil_img.convert("RGBA")
+        w, h = pil_img.size
+
+        if stretch_width:
+            scale = max_w / w
+            # Safety net: if stretching to full width would make an
+            # unusually tall/portrait image absurdly high (e.g. someone
+            # uploads the wrong file), fall back to a generous height cap
+            # instead of blowing out the page layout.
+            hard_cap_h = max_h * 1.6
+            if h * scale > hard_cap_h:
+                scale = hard_cap_h / h
+        else:
+            scale = min(max_w / w, max_h / h)
+        disp_w, disp_h = w * scale, h * scale
+
+        # Render at ~300 DPI worth of pixels for the final display size
+        # (rather than dumping the original, possibly-lower-res pixels
+        # straight into the PDF) so edges stay crisp instead of blurry
+        # when stretched across a wide banner.
+        target_px_w = disp_w / mm * (300 / 25.4)
+        target_px_h = disp_h / mm * (300 / 25.4)
+        pil_img = _enhance_clarity(pil_img, target_px_w, target_px_h)
+
+        buf2 = io.BytesIO()
+        pil_img.save(buf2, format="PNG")
+        buf2.seek(0)
+        img_flowable = RLImage(buf2, width=disp_w, height=disp_h)
+        # ReportLab's Image flowable defaults to CENTER alignment inside its
+        # available width. For the standard header/stamp we want it flush
+        # LEFT (under "Authorized Signatory & Stamp" and in the header);
+        # for a full-width banner logo we explicitly want CENTER instead.
+        img_flowable.hAlign = align
+        return img_flowable
+    except Exception:
+        return None
 
 
-if not _check_access_gate():
-    st.stop()
-
-
-st.title("🧾 Invoice Generator")
-st.caption("Fill in the details below and generate a branded, downloadable PDF invoice.")
-
-# ---------------------------------------------------------------------------
-# 1. Company selection
-# ---------------------------------------------------------------------------
-st.header("1. Company (From)")
-
-company_labels = {key: c["display_name"] for key, c in COMPANIES.items()}
-company_key = st.selectbox(
-    "Choose your company profile",
-    options=list(company_labels.keys()),
-    format_func=lambda k: company_labels[k],
-)
-company = dict(COMPANIES[company_key])  # shallow copy so edits don't mutate config
-
-col_a, col_b = st.columns(2)
-with col_a:
-    company["legal_name"] = clean_text(st.text_input("Company legal name", value=company["legal_name"]))
-    addr_text = st.text_area(
-        "Company address (one line per row)",
-        value="\n".join(company["address_lines"]), height=90,
+def build_invoice_pdf(data: dict) -> bytes:
+    """
+    data keys expected:
+      company: dict (see config.COMPANIES entries) with resolved logo/stamp
+               as either a filesystem path (str) or raw bytes under
+               'logo_bytes' / 'stamp_bytes' (uploaded overrides win).
+      invoice_title, invoice_no, invoice_date, lpo_no, payment_terms
+      bill_to_name, bill_to_address (list[str]), bill_to_cr, bill_to_vat
+      items: list of dicts: description, unit_price, qty, vat_percent,
+             extra: dict(col_name -> value)
+      extra_columns: list[str] (custom column names, in order)
+      account_name, iban, bank_note
+      notes (optional free text)
+    Returns: PDF bytes
+    """
+    styles = _style_sheet()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=18 * mm, rightMargin=18 * mm,
+        topMargin=14 * mm, bottomMargin=14 * mm,
+        title=xml_safe(data.get("invoice_no", "Invoice")),
     )
-    company["address_lines"] = [clean_text(l) for l in addr_text.split("\n") if l.strip()]
-    company["vat"] = clean_text(st.text_input("Company VAT number", value=company.get("vat", "")))
-    company["cr"] = clean_text(st.text_input("Company CR number", value=company.get("cr", "")))
-with col_b:
-    company["contact"] = clean_text(st.text_input("Contact number(s)", value=company.get("contact", "")))
-    company["email"] = clean_text(st.text_input("Email", value=company.get("email", "")))
-    company["account_name"] = clean_text(st.text_input("Bank account name", value=company.get("account_name", "")))
-    company["iban"] = clean_text(st.text_input("IBAN", value=company.get("iban", "")))
 
-st.subheader("Logo & Stamp")
-logo_col, stamp_col = st.columns(2)
+    company = data["company"]
+    story = []
 
-logo_override_bytes = None
-with logo_col:
-    logo_choice = st.radio(
-        "Logo", options=["Use company logo", CUSTOM_LOGO_LABEL],
-        horizontal=True, key="logo_choice",
-    )
-    if logo_choice == CUSTOM_LOGO_LABEL:
-        up = st.file_uploader("Upload logo (PNG/JPG, max 3MB)", type=["png", "jpg", "jpeg"], key="logo_up")
-        if up is not None:
-            try:
-                logo_override_bytes = validate_uploaded_image(up)
-                st.image(logo_override_bytes, width=180, caption="Logo preview")
-            except ValidationError as e:
-                st.error(str(e))
+    # ---------------------------------------------------------- header ----
+    header_style = company.get("header_style", "standard")
+    content_width = doc.width  # full usable width between margins
+
+    if header_style == "banner":
+        # The company supplied a single "full top part" image that already
+        # contains the logo, wordmark, and contact details -- so it's shown
+        # centered, spanning the page width, with no separate contact block
+        # underneath (that info is already inside the image).
+        banner_flowable = _safe_image(
+            data.get("logo_override_bytes") or company.get("logo_path"),
+            max_w=content_width, max_h=42 * mm, align="CENTER", stretch_width=True,
+        )
+        if banner_flowable:
+            story.append(banner_flowable)
+        story.append(Spacer(1, 6))
     else:
-        st.image(company["logo_path"], width=180, caption="Company logo")
+        logo_flowable = _safe_image(
+            data.get("logo_override_bytes") or company.get("logo_path"),
+            max_w=70 * mm, max_h=28 * mm, align="LEFT",
+        )
+        contact_lines = []
+        if company.get("contact"):
+            contact_lines.append(f"Contact: {xml_safe(company['contact'])}")
+        if company.get("email"):
+            contact_lines.append(f"Email: {xml_safe(company['email'])}")
+        if company.get("cr"):
+            contact_lines.append(f"CR: {xml_safe(company['cr'])}")
+        contact_para = Paragraph("<br/>".join(contact_lines), styles["SmallRight"])
 
-stamp_override_bytes = None
-stamp_path_to_use = company["stamp_path"]
-with stamp_col:
-    stamp_choice = st.radio(
-        "Stamp", options=["Use company stamp", CUSTOM_STAMP_LABEL, NO_STAMP_LABEL],
-        horizontal=True, key="stamp_choice",
+        header_table = Table(
+            [[logo_flowable or "", contact_para]],
+            colWidths=[100 * mm, None],
+        )
+        header_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        story.append(header_table)
+        story.append(Spacer(1, 6))
+
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#999999")))
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph(xml_safe(data.get("invoice_title") or company.get("invoice_title", "TAX INVOICE")),
+                            styles["InvoiceTitle"]))
+
+    # -------------------------------------------------- meta info table ---
+    meta_rows = [
+        ["Date:", xml_safe(data.get("invoice_date", ""))],
+        ["Invoice No.:", xml_safe(data.get("invoice_no", ""))],
+        ["LPO No.:", xml_safe(data.get("lpo_no", "") or "--------")],
+        ["Payment Terms:", xml_safe(data.get("payment_terms", "ASAP"))],
+    ]
+    meta_table = Table(
+        [[Paragraph(f"<b>{r[0]}</b>", styles["Cell"]), Paragraph(r[1], styles["Cell"])] for r in meta_rows],
+        colWidths=[45 * mm, None],
     )
-    if stamp_choice == CUSTOM_STAMP_LABEL:
-        up2 = st.file_uploader("Upload stamp (PNG/JPG, max 3MB)", type=["png", "jpg", "jpeg"], key="stamp_up")
-        if up2 is not None:
-            try:
-                stamp_override_bytes = validate_uploaded_image(up2)
-                st.image(stamp_override_bytes, width=140, caption="Stamp preview")
-            except ValidationError as e:
-                st.error(str(e))
-        stamp_path_to_use = None
-    elif stamp_choice == NO_STAMP_LABEL:
-        stamp_path_to_use = None
-    else:
-        st.image(company["stamp_path"], width=140, caption="Company stamp")
+    meta_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(meta_table)
+    story.append(Spacer(1, 8))
 
-company["stamp_path"] = stamp_path_to_use
+    # --------------------------------------------------- billed-to / from -
+    bill_addr = "<br/>".join(xml_safe(l) for l in data.get("bill_to_address", []) if l)
+    from_addr = "<br/>".join(xml_safe(l) for l in company.get("address_lines", []) if l)
 
-st.divider()
+    bill_bottom = bill_addr
+    if data.get("bill_to_cr"):
+        bill_bottom += f"<br/>CR: {xml_safe(data['bill_to_cr'])}"
+    if data.get("bill_to_vat"):
+        bill_bottom += f"<br/>VAT: {xml_safe(data['bill_to_vat'])}"
 
-# ---------------------------------------------------------------------------
-# 2. Billed-to client
-# ---------------------------------------------------------------------------
-st.header("2. Billed To (Client)")
+    from_bottom = from_addr
+    if company.get("vat"):
+        from_bottom += f"<br/>VAT: {xml_safe(company['vat'])}"
 
-client_options = list(PRESET_CLIENTS.keys()) + [NEW_CLIENT_LABEL]
-client_choice = st.selectbox("Choose a saved client or add a new one", options=client_options)
+    divider_color = colors.HexColor("#9AA3AF")
 
-if client_choice == NEW_CLIENT_LABEL:
-    default_client = {"name": "", "address_lines": [""], "cr": "", "vat": ""}
-else:
-    default_client = PRESET_CLIENTS[client_choice]
+    bill_cell = [
+        Paragraph(f"<b>Billed To:</b><br/><b>{xml_safe(data.get('bill_to_name',''))}</b>", styles["Cell"]),
+        HRFlowable(width="100%", thickness=0.6, color=divider_color, spaceBefore=4, spaceAfter=4),
+        Paragraph(bill_bottom, styles["Cell"]),
+    ]
+    from_cell = [
+        Paragraph(f"<b>From:</b><br/><b>{xml_safe(company.get('legal_name',''))}</b>", styles["Cell"]),
+        HRFlowable(width="100%", thickness=0.6, color=divider_color, spaceBefore=4, spaceAfter=4),
+        Paragraph(from_bottom, styles["Cell"]),
+    ]
 
-c1, c2 = st.columns(2)
-with c1:
-    bill_name = clean_text(st.text_input("Client name", value=default_client["name"]))
-    bill_addr_text = st.text_area(
-        "Client address (one line per row)",
-        value="\n".join(default_client["address_lines"]), height=90,
+    parties_table = Table(
+        [[bill_cell, from_cell]],
+        colWidths=[None, None],
     )
-    bill_to_address = [clean_text(l) for l in bill_addr_text.split("\n") if l.strip()]
-with c2:
-    bill_cr = clean_text(st.text_input("Client CR number", value=default_client.get("cr", "")))
-    bill_vat = clean_text(st.text_input("Client VAT number", value=default_client.get("vat", "")))
+    parties_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(parties_table)
+    story.append(Spacer(1, 8))
 
-st.divider()
+    # ------------------------------------------------------- items table --
+    extra_columns = data.get("extra_columns", [])
+    has_vat_column = any(item.get("vat_percent", 0) not in (None, "") for item in data["items"])
 
-# ---------------------------------------------------------------------------
-# 3. Invoice meta
-# ---------------------------------------------------------------------------
-st.header("3. Invoice Details")
+    header = ["S.No", "Description"] + extra_columns + ["Unit Price", "Qty"]
+    if has_vat_column:
+        header += ["VAT %", "VAT Amt"]
+    header += ["Total"]
+    header_row = [Paragraph(h, styles["CellHeader"]) for h in header]
 
-m1, m2, m3, m4 = st.columns(4)
-with m1:
-    invoice_date = st.date_input("Date", value=datetime.date.today())
-with m2:
-    invoice_no = clean_text(st.text_input("Invoice No.", value=""))
-with m3:
-    lpo_no = clean_text(st.text_input("LPO No. (optional)", value=""))
-with m4:
-    payment_terms = clean_text(st.text_input("Payment Terms", value="ASAP"))
+    rows = [header_row]
+    subtotal = 0.0
+    total_vat = 0.0
 
-invoice_title = clean_text(
-    st.text_input("Document title", value=company.get("invoice_title", "TAX INVOICE"))
-)
+    for idx, item in enumerate(data["items"], start=1):
+        desc = xml_safe(item.get("description", ""))
+        unit_price = float(item.get("unit_price", 0) or 0)
+        qty_raw = item.get("qty", 1)
+        try:
+            qty_num = float(qty_raw)
+            qty_display = f"{qty_num:g}"
+        except (TypeError, ValueError):
+            qty_num = 1.0
+            qty_display = xml_safe(str(qty_raw) or "1")
+        vat_percent = item.get("vat_percent", 0) or 0
+        try:
+            vat_percent = float(vat_percent)
+        except (TypeError, ValueError):
+            vat_percent = 0.0
 
-st.divider()
-
-# ---------------------------------------------------------------------------
-# 4. Line items table
-# ---------------------------------------------------------------------------
-st.header("4. Items")
-
-st.caption(
-    "Add line items below. You can also add extra custom columns "
-    f"(e.g. 'Remarks', 'Period') — up to {MAX_EXTRA_COLUMNS}. "
-    "Unit Price × Qty, VAT and totals are calculated automatically."
-)
-
-extra_cols_text = st.text_input(
-    "Extra custom column names (comma-separated, optional)",
-    value="",
-    help="Example: Remarks, Period",
-)
-extra_columns = []
-if extra_cols_text.strip():
-    for c in extra_cols_text.split(","):
-        c = clean_text(c, 40)
-        if c and c not in extra_columns:
-            extra_columns.append(c)
-    extra_columns = extra_columns[:MAX_EXTRA_COLUMNS]
-
-if "n_rows" not in st.session_state:
-    st.session_state.n_rows = 1
-
-row_ctrl_col1, row_ctrl_col2, _ = st.columns([1, 1, 4])
-with row_ctrl_col1:
-    if st.button("➕ Add row") and st.session_state.n_rows < MAX_ITEM_ROWS:
-        st.session_state.n_rows += 1
-with row_ctrl_col2:
-    if st.button("➖ Remove row") and st.session_state.n_rows > 1:
-        st.session_state.n_rows -= 1
-
-n_rows = bounded_int(st.session_state.n_rows, 1, MAX_ITEM_ROWS, 1)
-st.session_state.n_rows = n_rows
-
-items = []
-for i in range(n_rows):
-    with st.container(border=True):
-        cols = st.columns([3] + [1.3] * len(extra_columns) + [1.2, 0.9, 1])
-        desc = clean_text(
-            cols[0].text_input(f"Description #{i+1}", key=f"desc_{i}",
-                                placeholder="Charges for cleaning services for the month of ..."),
-            300,
-        )
-        extra_vals = {}
-        for j, col_name in enumerate(extra_columns):
-            extra_vals[col_name] = clean_text(
-                cols[1 + j].text_input(col_name, key=f"extra_{i}_{j}"), 120
-            )
-        unit_price = bounded_float(
-            cols[1 + len(extra_columns)].number_input(
-                "Unit Price", key=f"price_{i}", min_value=0.0, max_value=1_000_000.0,
-                value=0.0, step=0.5, format="%.3f",
-            ), 0.0, 1_000_000.0, 0.0,
-        )
-        qty = bounded_float(
-            cols[2 + len(extra_columns)].number_input(
-                "Qty", key=f"qty_{i}", min_value=0.0, max_value=100_000.0,
-                value=1.0, step=1.0,
-            ), 0.0, 100_000.0, 1.0,
-        )
-        vat_percent = bounded_float(
-            cols[3 + len(extra_columns)].number_input(
-                "VAT %", key=f"vat_{i}", min_value=0.0, max_value=100.0,
-                value=DEFAULT_VAT_PERCENT, step=1.0,
-            ), 0.0, 100.0, DEFAULT_VAT_PERCENT,
-        )
-        line_amount = unit_price * qty
+        line_amount = unit_price * qty_num
         line_vat = line_amount * vat_percent / 100.0
-        st.caption(f"Line total: **{line_amount + line_vat:,.3f} {CURRENCY}**  "
-                   f"(Amount {line_amount:,.3f} + VAT {line_vat:,.3f})")
+        line_total = line_amount + line_vat
 
-        items.append({
-            "description": desc,
-            "unit_price": unit_price,
-            "qty": qty,
-            "vat_percent": vat_percent,
-            "extra": extra_vals,
-        })
+        subtotal += line_amount
+        total_vat += line_vat
 
-subtotal = sum(it["unit_price"] * it["qty"] for it in items)
-total_vat = sum(it["unit_price"] * it["qty"] * it["vat_percent"] / 100.0 for it in items)
-grand_total = subtotal + total_vat
+        row = [
+            Paragraph(str(idx), styles["Cell"]),
+            Paragraph(desc, styles["Cell"]),
+        ]
+        for col in extra_columns:
+            row.append(Paragraph(xml_safe(item.get("extra", {}).get(col, "")), styles["Cell"]))
+        row.append(Paragraph(f"{unit_price:,.3f}", styles["CellRight"]))
+        row.append(Paragraph(qty_display, styles["CellCenter"]))
+        if has_vat_column:
+            row.append(Paragraph(f"{vat_percent:g}%", styles["CellCenter"]))
+            row.append(Paragraph(f"{line_vat:,.3f}", styles["CellRight"]))
+        row.append(Paragraph(f"{line_total:,.3f}", styles["CellRight"]))
+        rows.append(row)
 
-st.markdown(
-    f"### Subtotal: {subtotal:,.3f} {CURRENCY}  |  VAT: {total_vat:,.3f} {CURRENCY}  |  "
-    f"**Grand Total: {grand_total:,.3f} {CURRENCY}**"
-)
+    grand_total = subtotal + total_vat
 
-st.divider()
+    # totals row
+    n_cols = len(header)
+    totals_label_span = n_cols - (2 if has_vat_column else 1) - 1
+    totals_row = [""] * n_cols
+    totals_row[0] = Paragraph("<b>Total</b>", styles["BoldCell"])
+    if has_vat_column:
+        totals_row[-2] = Paragraph(f"<b>{total_vat:,.3f}</b>", styles["CellRight"])
+    totals_row[-1] = Paragraph(f"<b>{grand_total:,.3f}</b>", styles["CellRight"])
+    rows.append(totals_row)
 
-# ---------------------------------------------------------------------------
-# 5. Payment details override + notes
-# ---------------------------------------------------------------------------
-st.header("5. Payment Details & Notes")
-p1, p2 = st.columns(2)
-with p1:
-    account_name = clean_text(st.text_input("Account name on invoice", value=company["account_name"]))
-    iban_val = clean_text(st.text_input("IBAN on invoice", value=company["iban"]))
-with p2:
-    notes = clean_multiline(
-        st.text_area("Footer note", value="Please arrange payment at your earliest convenience.", height=80)
+    n_extra = len(extra_columns)
+    col_widths = [12 * mm, None] + [22 * mm] * n_extra + [24 * mm, 14 * mm]
+    if has_vat_column:
+        col_widths += [16 * mm, 20 * mm]
+    col_widths += [24 * mm]
+
+    items_table = Table(rows, colWidths=col_widths, repeatRows=1)
+    items_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -2), 0.6, colors.black),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.black),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.black),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EDEDED")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("SPAN", (0, -1), (totals_label_span, -1)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(items_table)
+    story.append(Spacer(1, 8))
+
+    # ------------------------------------------------------------ totals -
+    story.append(Paragraph(f"<b>Total: {grand_total:,.3f} {CURRENCY}</b>", styles["Small"]))
+    story.append(Paragraph(f"Amount in Words: {xml_safe(amount_to_words(grand_total, CURRENCY))}",
+                            styles["Small"]))
+    story.append(Spacer(1, 8))
+
+    # -------------------------------------------------------- payment ----
+    story.append(Paragraph("<b>Payment Details:</b>", styles["Small"]))
+    story.append(Paragraph(
+        f"Account Name: <b>{xml_safe(data.get('account_name', company.get('account_name','')))}</b>",
+        styles["Small"]))
+    story.append(Paragraph(
+        f"IBAN: <b>{xml_safe(data.get('iban', company.get('iban','')))}</b>",
+        styles["Small"]))
+    story.append(Spacer(1, 8))
+
+    if data.get("notes"):
+        story.append(Paragraph(xml_safe(data["notes"]), styles["Small"]))
+        story.append(Spacer(1, 8))
+    else:
+        story.append(Paragraph("Please arrange payment at your earliest convenience.", styles["Small"]))
+        story.append(Spacer(1, 8))
+
+    story.append(Paragraph("<b>Authorized Signatory &amp; Stamp</b>", styles["Small"]))
+    story.append(Spacer(1, 6))
+
+    stamp_flowable = _safe_image(
+        data.get("stamp_override_bytes") or company.get("stamp_path"),
+        max_w=42 * mm, max_h=42 * mm, align="LEFT",
     )
+    if stamp_flowable:
+        story.append(stamp_flowable)
 
-st.divider()
+    def _page_decorations(canvas, doc_):
+        page_w, page_h = doc_.pagesize
+        canvas.saveState()
 
-# ---------------------------------------------------------------------------
-# 6. Generate
-# ---------------------------------------------------------------------------
-st.header("6. Generate Invoice")
+        # ---- paper background (matches the sampled tone of the original
+        # scanned invoices, instead of ReportLab's default stark white) ----
+        canvas.setFillColor(colors.HexColor(PAGE_BACKGROUND_COLOR))
+        canvas.rect(0, 0, page_w, page_h, stroke=0, fill=1)
+        canvas.restoreState()
 
-errors = []
-if not bill_name:
-    errors.append("Client name is required.")
-if not invoice_no:
-    errors.append("Invoice No. is required.")
-if all(not it["description"] for it in items):
-    errors.append("At least one line item needs a description.")
+        # ---- footer band (only for companies whose sample has one) ----
+        tagline = company.get("footer_tagline")
+        if tagline:
+            canvas.saveState()
+            band_h = 8 * mm
+            bg = company.get("footer_bg_color") or company.get("brand_color", "#1F3864")
+            fg = company.get("footer_text_color", "#FFFFFF")
+            accent = company.get("footer_accent_color")
 
-if errors:
-    for e in errors:
-        st.warning(e)
+            canvas.setFillColor(colors.HexColor(bg))
+            canvas.rect(0, 0, page_w, band_h, stroke=0, fill=1)
 
-generate = st.button("📄 Generate PDF", type="primary", disabled=bool(errors))
+            if accent:
+                accent_w = 14 * mm
+                canvas.setFillColor(colors.HexColor(accent))
+                canvas.rect(page_w - accent_w, 0, accent_w, band_h, stroke=0, fill=1)
 
-if generate and not errors:
-    invoice_data = {
-        "company": company,
-        "logo_override_bytes": logo_override_bytes,
-        "stamp_override_bytes": stamp_override_bytes,
-        "invoice_title": invoice_title,
-        "invoice_no": invoice_no,
-        "invoice_date": invoice_date.strftime("%d/%m/%Y"),
-        "lpo_no": lpo_no,
-        "payment_terms": payment_terms,
-        "bill_to_name": bill_name,
-        "bill_to_address": bill_to_address,
-        "bill_to_cr": bill_cr,
-        "bill_to_vat": bill_vat,
-        "items": items,
-        "extra_columns": extra_columns,
-        "account_name": account_name,
-        "iban": iban_val,
-        "notes": notes,
-    }
-    try:
-        with st.spinner("Building your PDF..."):
-            pdf_bytes = build_invoice_pdf(invoice_data)
-        st.success("Invoice generated!")
-        fname = safe_filename(invoice_no, default="invoice") + ".pdf"
-        st.download_button(
-            "⬇️ Download PDF", data=pdf_bytes, file_name=fname, mime="application/pdf",
-        )
-        st.caption(f"File name: {fname}")
-    except Exception as e:  # noqa: BLE001 - surface a clean message, log detail server-side
-        st.error("Something went wrong while generating the PDF. Please check your inputs and try again.")
-        st.exception(e)
+            canvas.setFillColor(colors.HexColor(fg))
+            canvas.setFont("Helvetica", 7.5)
+            canvas.drawCentredString(page_w / 2.0, band_h / 2.0 - 2.5, tagline[:180])
+            canvas.restoreState()
+
+    doc.build(story, onFirstPage=_page_decorations, onLaterPages=_page_decorations)
+    return buf.getvalue()
