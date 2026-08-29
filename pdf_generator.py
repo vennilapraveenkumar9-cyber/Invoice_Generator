@@ -34,6 +34,12 @@ from config import PAGE_BACKGROUND_COLOR
 
 CURRENCY = "BHD"
 
+# Target print resolution for embedded logo/stamp/banner images. Source
+# scans are often lower-res than this; we resample up to it with a
+# high-quality filter + unsharp mask (see _enhance_clarity) so edges look
+# crisp in the PDF instead of soft/blurry when stretched to size.
+TARGET_DPI = 300
+
 
 def _style_sheet():
     styles = getSampleStyleSheet()
@@ -74,9 +80,61 @@ def _style_sheet():
     return styles
 
 
-def _safe_image(path_or_bytes, max_w, max_h, align="LEFT"):
-    """Load an image (path or raw bytes) and scale it to fit within a box,
-    preserving aspect ratio. Returns None if the image can't be loaded."""
+def _enhance_clarity(pil_img, target_px_w, target_px_h):
+    """
+    Improve the *perceived* sharpness/clarity of a logo/stamp image before
+    it's embedded in the PDF.
+
+    Scanned letterhead crops tend to look soft once stretched to fill a
+    wide banner. We can't invent detail that isn't in the source, but we
+    can:
+      1. Resize with LANCZOS (a high-quality resampling filter) to the
+         exact pixel size the PDF will actually display it at, instead of
+         letting the PDF viewer do a cheap scale -- this alone removes a
+         lot of the "blurry stretch" look.
+      2. Apply a mild autocontrast pass to punch up washed-out scan
+         contrast (common with these scanned invoices).
+      3. Apply an UnsharpMask to recover crisp edges after resizing.
+    """
+    from PIL import Image as PILImage, ImageOps, ImageFilter
+
+    target_px_w = max(1, int(target_px_w))
+    target_px_h = max(1, int(target_px_h))
+
+    resized = pil_img.resize((target_px_w, target_px_h), resample=PILImage.LANCZOS)
+
+    # autocontrast needs an alpha-free image to work on cleanly; reapply
+    # the original alpha channel afterwards if present.
+    if resized.mode == "RGBA":
+        rgb = resized.convert("RGB")
+        alpha = resized.split()[-1]
+        rgb = ImageOps.autocontrast(rgb, cutoff=1)
+        rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.6, percent=140, threshold=3))
+        resized = rgb.convert("RGBA")
+        resized.putalpha(alpha)
+    else:
+        resized = ImageOps.autocontrast(resized.convert("RGB"), cutoff=1)
+        resized = resized.filter(ImageFilter.UnsharpMask(radius=1.6, percent=140, threshold=3))
+
+    return resized
+
+
+def _safe_image(path_or_bytes, max_w, max_h, align="LEFT", stretch_width=False):
+    """
+    Load an image (path or raw bytes), sharpen/clean it up, and scale it
+    to fit within a box.
+
+    stretch_width=False (default): fit within (max_w, max_h) preserving
+        aspect ratio -- used for the YSCC-style logo and the stamp, so
+        they're never distorted.
+    stretch_width=True: always fill the full max_w edge-to-edge (height
+        follows the image's own aspect ratio) -- used for the full-page
+        letterhead banner so it visually spans the page like the samples,
+        instead of floating with side margins if its aspect ratio happens
+        to be wider than max_h allows.
+
+    Returns None if the image can't be loaded.
+    """
     if not path_or_bytes:
         return None
     try:
@@ -88,18 +146,38 @@ def _safe_image(path_or_bytes, max_w, max_h, align="LEFT"):
             if not os.path.isfile(path_or_bytes):
                 return None
             pil_img = PILImage.open(path_or_bytes)
+        pil_img = pil_img.convert("RGBA")
         w, h = pil_img.size
-        scale = min(max_w / w, max_h / h)
+
+        if stretch_width:
+            scale = max_w / w
+            # Safety net: if stretching to full width would make an
+            # unusually tall/portrait image absurdly high (e.g. someone
+            # uploads the wrong file), fall back to a generous height cap
+            # instead of blowing out the page layout.
+            hard_cap_h = max_h * 1.6
+            if h * scale > hard_cap_h:
+                scale = hard_cap_h / h
+        else:
+            scale = min(max_w / w, max_h / h)
         disp_w, disp_h = w * scale, h * scale
 
+        # Render at ~300 DPI worth of pixels for the final display size
+        # (rather than dumping the original, possibly-lower-res pixels
+        # straight into the PDF) so edges stay crisp instead of blurry
+        # when stretched across a wide banner.
+        target_px_w = disp_w / mm * (300 / 25.4)
+        target_px_h = disp_h / mm * (300 / 25.4)
+        pil_img = _enhance_clarity(pil_img, target_px_w, target_px_h)
+
         buf2 = io.BytesIO()
-        pil_img.convert("RGBA").save(buf2, format="PNG")
+        pil_img.save(buf2, format="PNG")
         buf2.seek(0)
         img_flowable = RLImage(buf2, width=disp_w, height=disp_h)
         # ReportLab's Image flowable defaults to CENTER alignment inside its
-        # available width. We make this explicit and configurable: LEFT for
-        # the small YSCC-style logo and the signature stamp (flush with the
-        # text beside/above it), CENTER for a full-width letterhead banner.
+        # available width. For the standard header/stamp we want it flush
+        # LEFT (under "Authorized Signatory & Stamp" and in the header);
+        # for a full-width banner logo we explicitly want CENTER instead.
         img_flowable.hAlign = align
         return img_flowable
     except Exception:
@@ -144,7 +222,7 @@ def build_invoice_pdf(data: dict) -> bytes:
         # underneath (that info is already inside the image).
         banner_flowable = _safe_image(
             data.get("logo_override_bytes") or company.get("logo_path"),
-            max_w=content_width, max_h=42 * mm, align="CENTER",
+            max_w=content_width, max_h=42 * mm, align="CENTER", stretch_width=True,
         )
         if banner_flowable:
             story.append(banner_flowable)
