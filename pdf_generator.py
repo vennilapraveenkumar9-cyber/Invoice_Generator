@@ -389,6 +389,8 @@ def build_invoice_pdf(data: dict) -> bytes:
         story.append(stamp_flowable)
 
     def _page_decorations(canvas, doc_):
+        from reportlab.lib.utils import ImageReader
+
         page_w, page_h = doc_.pagesize
         canvas.saveState()
 
@@ -398,27 +400,47 @@ def build_invoice_pdf(data: dict) -> bytes:
         canvas.rect(0, 0, page_w, page_h, stroke=0, fill=1)
         canvas.restoreState()
 
-        # ---- footer band (only for companies whose sample has one) ----
-        tagline = company.get("footer_tagline")
-        if tagline:
-            canvas.saveState()
-            band_h = 8 * mm
-            bg = company.get("footer_bg_color") or company.get("brand_color", "#1F3864")
-            fg = company.get("footer_text_color", "#FFFFFF")
-            accent = company.get("footer_accent_color")
+        # ---- faint decorative watermark (YSCC only), extracted from the
+        # official letterhead with a transparent background, drawn low in
+        # the page behind all text/tables ----
+        watermark_path = company.get("watermark_path")
+        if watermark_path and os.path.isfile(watermark_path):
+            try:
+                canvas.saveState()
+                wm_reader = ImageReader(watermark_path)
+                wm_w_px, wm_h_px = wm_reader.getSize()
+                wm_aspect = wm_h_px / wm_w_px
+                wm_w = page_w * 0.62
+                wm_h = wm_w * wm_aspect
+                wm_x = page_w * 0.20
+                wm_y = 10 * mm
+                canvas.drawImage(
+                    wm_reader, wm_x, wm_y, width=wm_w, height=wm_h,
+                    mask="auto", preserveAspectRatio=True,
+                )
+                canvas.restoreState()
+            except Exception:
+                pass
 
-            canvas.setFillColor(colors.HexColor(bg))
-            canvas.rect(0, 0, page_w, band_h, stroke=0, fill=1)
-
-            if accent:
-                accent_w = 14 * mm
-                canvas.setFillColor(colors.HexColor(accent))
-                canvas.rect(page_w - accent_w, 0, accent_w, band_h, stroke=0, fill=1)
-
-            canvas.setFillColor(colors.HexColor(fg))
-            canvas.setFont("Helvetica", 7.5)
-            canvas.drawCentredString(page_w / 2.0, band_h / 2.0 - 2.5, tagline[:180])
-            canvas.restoreState()
+        # ---- footer band: the exact graphic from the official letterhead
+        # (not a code-drawn rectangle), stretched full-width at the bottom
+        # of every page, only for companies that have one ----
+        footer_path = company.get("footer_image_path")
+        if footer_path and os.path.isfile(footer_path):
+            try:
+                canvas.saveState()
+                fw_reader = ImageReader(footer_path)
+                fw_w_px, fw_h_px = fw_reader.getSize()
+                fw_aspect = fw_h_px / fw_w_px
+                fw_w = page_w
+                fw_h = fw_w * fw_aspect
+                canvas.drawImage(
+                    fw_reader, 0, 0, width=fw_w, height=fw_h,
+                    mask="auto", preserveAspectRatio=False,
+                )
+                canvas.restoreState()
+            except Exception:
+                pass
 
     doc.build(story, onFirstPage=_page_decorations, onLaterPages=_page_decorations)
     return buf.getvalue()
