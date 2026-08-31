@@ -15,6 +15,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 LOGOS_DIR = os.path.join(ASSETS_DIR, "logos")
 STAMPS_DIR = os.path.join(ASSETS_DIR, "stamps")
+FOOTERS_DIR = os.path.join(ASSETS_DIR, "footers")
+WATERMARKS_DIR = os.path.join(ASSETS_DIR, "watermarks")
 
 # ---------------------------------------------------------------------------
 # Security / sanity limits (also enforced again in security.py)
@@ -28,7 +30,14 @@ MAX_TEXT_LEN = 500                     # cap on any single free-text field
 MAX_MULTILINE_LEN = 1500               # cap on address / notes blocks
 
 # ---------------------------------------------------------------------------
-# Company profiles ("From" side of the invoice, logo, stamp, bank details)
+# Company profiles ("From" side of the invoice, logo, stamp, bank details).
+#
+# Both YSCC and Whiteness Cleaning are now built to match the *official*
+# letterhead files the company sent (LETTER_HEAD_WCS.docx and
+# YSCC_NEW_LTRHEAD2024.docx) pixel-for-pixel: the exact logo graphic, the
+# exact footer band graphic, and (for YSCC) the exact faint background
+# watermark shape -- all extracted directly from those files rather than
+# redrawn/approximated.
 # ---------------------------------------------------------------------------
 COMPANIES = {
     "yscc": {
@@ -46,49 +55,26 @@ COMPANIES = {
         "email": "ysccbahrain@gmail.com",
         "account_name": "Yaqoob sons contracting company",
         "iban": "BH53FIBH11000487340001",
-        "footer_tagline": "General Cleaning | Carpet / Sofa Shampooing | Marble Polishing | "
-                           "Water Tank Cleaning | Facade Cleaning | etc.",
-        "footer_bg_color": "#0F4E82",
-        "footer_text_color": "#FFFFFF",
-        "footer_accent_color": "#DC3C62",
-        "brand_color": "#D81F42",
         "invoice_title": "TAX INVOICE",
         # YSCC keeps the original layout: small logo top-left + contact
-        # info (Contact/Email/CR) printed top-right by our code.
+        # info (Contact/Email/CR) printed top-right by our code -- this
+        # matches the official letterhead exactly (logo + text, not a
+        # single flattened banner image).
         "header_style": "standard",
-    },
-    "aljameel": {
-        "display_name": "Al Jameel Tower Construction & Trading",
-        "legal_name": "Al Jameel Tower Construction & Trading",
-        "logo_path": os.path.join(LOGOS_DIR, "aljameel.png"),
-        "stamp_path": os.path.join(STAMPS_DIR, "aljameel.png"),
-        "address_lines": [
-            "Flat/Shop No: -0, Building No: -12, Road/Street No: -58, Buri",
-            "Block No: -756, Kingdom of Bahrain",
-        ],
-        "vat": "220004058200002",
-        "cr": "27387-3, RD: 58, Bld: 12, Blk: 756 BURI",
-        "contact": "33569858 / 38736809",
-        "email": "aljameeltc@gmail.com",
-        "account_name": "Al Jameel Tower Construction & Trading",
-        "iban": "BH63BIBB00100000100082",
-        "footer_tagline": "CR: 27387-3, RD: 58, Bld: 12, Blk: 756 BURI | "
-                           "Contact: 33569858 38736809 | Email: aljameeltc@gmail.com",
-        "footer_bg_color": "#5D6E85",
-        "footer_text_color": "#FFFFFF",
-        "footer_accent_color": "",
-        "brand_color": "#1789C9",
-        "invoice_title": "TAX INVOICE",
-        # The uploaded logo file for this company IS the full letterhead
-        # (logo + Arabic/English name + contact block), so it's centered
-        # and stretched across the top instead of paired with separate
-        # code-generated contact text.
-        "header_style": "banner",
+        # Exact footer band image extracted from the official letterhead
+        # (navy bar, left-aligned tagline, white icon, red accent block)
+        # instead of a code-drawn rectangle -- pixel-identical to the
+        # letterhead file.
+        "footer_image_path": os.path.join(FOOTERS_DIR, "yscc.png"),
+        # Faint decorative watermark shape from the official letterhead,
+        # extracted with a transparent background. Drawn low-opacity in
+        # the lower part of the page, behind all text/tables.
+        "watermark_path": os.path.join(WATERMARKS_DIR, "yscc.png"),
     },
     "whiteness": {
         "display_name": "Whiteness Cleaning",
         "legal_name": "Whiteness Cleaning",
-        "logo_path": os.path.join(LOGOS_DIR, "whiteness(1).png"),
+        "logo_path": os.path.join(LOGOS_DIR, "whiteness.png"),
         "stamp_path": os.path.join(STAMPS_DIR, "whiteness.png"),
         "address_lines": [
             "Building 1172, Road 5443, Buri",
@@ -100,19 +86,26 @@ COMPANIES = {
         "email": "whiteness2023jameel@gmail.com",
         "account_name": "Whiteness Cleaning",
         "iban": "BH63 ALSA 0025 5773 1001 00",
-        "footer_tagline": "",
-        "footer_bg_color": "#E23054",
-        "footer_text_color": "#FFFFFF",
-        "footer_accent_color": "",
-        "brand_color": "#E23054",
         "invoice_title": "INVOICE",
-        # Same as Al Jameel: the logo file is the full top letterhead.
+        # The logo file for Whiteness IS the full official letterhead
+        # banner (logo + Arabic/English name + contact block on both
+        # sides), extracted directly from the company's docx -- so it's
+        # centered and stretched across the top, with no separate
+        # code-generated contact text next to it.
         "header_style": "banner",
+        # Exact footer band image from the official letterhead (red line
+        # + indigo bar + centered white tagline text).
+        "footer_image_path": os.path.join(FOOTERS_DIR, "whiteness.png"),
+        "watermark_path": None,
     },
 }
 
 # ---------------------------------------------------------------------------
-# Preset "Billed To" clients, extracted from historical sample invoices.
+# Preset "Billed To" clients. These are independent of which company issues
+# the invoice -- e.g. "Ebrahim Ali Trading Co W.L.L" was originally seen as
+# a client on an Al Jameel invoice, but the address itself is just client
+# data and stays available here for billing from any company, even though
+# Al Jameel is no longer offered as an issuing company profile above.
 # The user can still choose "+ New client" and type a fresh address.
 # ---------------------------------------------------------------------------
 PRESET_CLIENTS = {
@@ -174,6 +167,18 @@ PRESET_CLIENTS = {
         ],
         "cr": "",
         "vat": "200010112700002",
+    },
+    # Al Jameel Tower Construction & Trading itself is no longer offered as
+    # an issuing company, but its own address/VAT/CR is kept here as a
+    # billable client in case either remaining company ever invoices them.
+    "Al Jameel Tower Construction & Trading": {
+        "name": "M/S. Al Jameel Tower Construction & Trading",
+        "address_lines": [
+            "Flat/Shop No: -0, Building No: -12, Road/Street No: -58, Buri",
+            "Block No: -756, Kingdom of Bahrain",
+        ],
+        "cr": "27387-3",
+        "vat": "220004058200002",
     },
 }
 
