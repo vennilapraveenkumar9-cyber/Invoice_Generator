@@ -29,6 +29,8 @@ Security notes (see security.py for the implementation):
 
 import datetime
 import io
+import uuid
+
 
 import streamlit as st
 
@@ -225,49 +227,71 @@ if extra_cols_text.strip():
             extra_columns.append(c)
     extra_columns = extra_columns[:MAX_EXTRA_COLUMNS]
 
-if "n_rows" not in st.session_state:
-    st.session_state.n_rows = 1
+if "row_ids" not in st.session_state:
+    st.session_state.row_ids = [str(uuid.uuid4())]
 
-row_ctrl_col1, row_ctrl_col2, _ = st.columns([1, 1, 4])
+row_ctrl_col1, row_ctrl_col2, row_ctrl_col3 = st.columns([1.3, 1.6, 3.1])
 with row_ctrl_col1:
-    if st.button("➕ Add row") and st.session_state.n_rows < MAX_ITEM_ROWS:
-        st.session_state.n_rows += 1
+    if st.button("➕ Add row") and len(st.session_state.row_ids) < MAX_ITEM_ROWS:
+        st.session_state.row_ids.append(str(uuid.uuid4()))
+        st.rerun()
 with row_ctrl_col2:
-    if st.button("➖ Remove row") and st.session_state.n_rows > 1:
-        st.session_state.n_rows -= 1
+    selected_ids = [
+        rid for rid in st.session_state.row_ids
+        if st.session_state.get(f"select_{rid}", False)
+    ]
+    delete_disabled = not selected_ids or len(selected_ids) >= len(st.session_state.row_ids)
+    if st.button(f"🗑️ Delete selected ({len(selected_ids)})", disabled=delete_disabled):
+        st.session_state.row_ids = [
+            rid for rid in st.session_state.row_ids if rid not in selected_ids
+        ]
+        st.rerun()
+with row_ctrl_col3:
+    st.caption("Tick the checkbox on a row to select it, then delete one or several at once — "
+               "or use the 🗑️ on a single row to remove just that one.")
 
-n_rows = bounded_int(st.session_state.n_rows, 1, MAX_ITEM_ROWS, 1)
-st.session_state.n_rows = n_rows
+# Never allow every row to be deleted at once -- always keep at least one.
+row_ids = st.session_state.row_ids[:MAX_ITEM_ROWS]
+st.session_state.row_ids = row_ids
 
 items = []
-for i in range(n_rows):
+for position, rid in enumerate(row_ids, start=1):
     with st.container(border=True):
+        top_cols = st.columns([0.6, 5.4, 0.7])
+        top_cols[0].checkbox("Select", key=f"select_{rid}", label_visibility="collapsed")
+        top_cols[1].markdown(f"**Row {position}**")
+        row_delete_disabled = len(row_ids) <= 1
+        if top_cols[2].button("🗑️", key=f"del_{rid}", disabled=row_delete_disabled,
+                               help="Delete this row"):
+            st.session_state.row_ids = [r for r in row_ids if r != rid]
+            st.rerun()
+
         cols = st.columns([3] + [1.3] * len(extra_columns) + [1.2, 0.9, 1])
         desc = clean_text(
-            cols[0].text_input(f"Description #{i+1}", key=f"desc_{i}",
+            cols[0].text_input(f"Description #{position}", key=f"desc_{rid}",
                                 placeholder="Charges for cleaning services for the month of ..."),
             300,
         )
         extra_vals = {}
         for j, col_name in enumerate(extra_columns):
             extra_vals[col_name] = clean_text(
-                cols[1 + j].text_input(col_name, key=f"extra_{i}_{j}"), 120
+                cols[1 + j].text_input(col_name, key=f"extra_{rid}_{j}"), 120
             )
         unit_price = bounded_float(
             cols[1 + len(extra_columns)].number_input(
-                "Unit Price", key=f"price_{i}", min_value=0.0, max_value=1_000_000.0,
+                "Unit Price", key=f"price_{rid}", min_value=0.0, max_value=1_000_000.0,
                 value=0.0, step=0.5, format="%.3f",
             ), 0.0, 1_000_000.0, 0.0,
         )
         qty = bounded_float(
             cols[2 + len(extra_columns)].number_input(
-                "Qty", key=f"qty_{i}", min_value=0.0, max_value=100_000.0,
+                "Qty", key=f"qty_{rid}", min_value=0.0, max_value=100_000.0,
                 value=1.0, step=1.0,
             ), 0.0, 100_000.0, 1.0,
         )
         vat_percent = bounded_float(
             cols[3 + len(extra_columns)].number_input(
-                "VAT %", key=f"vat_{i}", min_value=0.0, max_value=100.0,
+                "VAT %", key=f"vat_{rid}", min_value=0.0, max_value=100.0,
                 value=DEFAULT_VAT_PERCENT, step=1.0,
             ), 0.0, 100.0, DEFAULT_VAT_PERCENT,
         )
